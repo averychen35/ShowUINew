@@ -8,8 +8,6 @@ import torch
 import wandb
 import random
 import numpy as np
-import tempfile
-import gc
 from tqdm import tqdm
 from PIL import Image, ImageDraw
 import torch.distributed as dist
@@ -87,7 +85,7 @@ def calculate_screenspot_metrics(results):
         logging.info(f"[{key}]: {value}")
     return metrics
 
-def crop_image_around_point(image_path, pred_point, crop_ratio=0.5, cleanup_original=False):
+def crop_image_around_point(image_path, pred_point, crop_ratio=0.5):
     """
     Crop image to 1/4 original size (1/2 width and height) centered around predicted point.
     
@@ -95,7 +93,6 @@ def crop_image_around_point(image_path, pred_point, crop_ratio=0.5, cleanup_orig
         image_path: Path to original image
         pred_point: Predicted point in normalized coordinates [0, 1]
         crop_ratio: Ratio for cropping (0.5 means 1/2 of original dimensions)
-        cleanup_original: Whether to delete the original image file after cropping
     
     Returns:
         cropped_image: PIL Image object
@@ -129,18 +126,6 @@ def crop_image_around_point(image_path, pred_point, crop_ratio=0.5, cleanup_orig
     
     # Resize back to original dimensions to maintain model compatibility
     cropped_image = cropped_image.resize((original_width, original_height), Image.LANCZOS)
-    
-    # Clean up original image from memory
-    original_image.close()
-    del original_image
-    
-    # Optionally delete the original file
-    if cleanup_original and os.path.exists(image_path):
-        try:
-            os.remove(image_path)
-            print(f"Deleted original image: {image_path}")
-        except OSError as e:
-            print(f"Warning: Could not delete {image_path}: {e}")
     
     crop_info = {
         'left': left,
@@ -251,43 +236,32 @@ def run_inference(model_engine, forward_dict, processor, max_new_tokens=128):
         
     return generated_text
 
-
-
 class CroppedImageDataset:
-    """Dataset for cropped images in second round inference with memory cleanup."""
+    """Dataset for cropped images in second round inference."""
     
-    def __init__(self, original_samples, first_predictions, crop_infos, cleanup_temp_files=True):
+    def __init__(self, original_samples, first_predictions, crop_infos):
         self.samples = []
-        self.temp_files = []  # Track temporary files for cleanup
-        self.cleanup_temp_files = cleanup_temp_files
-        
         for sample, pred_point, crop_info in zip(original_samples, first_predictions, crop_infos):
-            cropped_path = self._create_cropped_image(sample, pred_point)
             self.samples.append({
                 'original_sample': sample,
                 'first_pred_point': pred_point,
                 'crop_info': crop_info,
-                'cropped_image_path': cropped_path
+                'cropped_image_path': self._create_cropped_image(sample, pred_point)
             })
-            self.temp_files.append(cropped_path)
     
     def _create_cropped_image(self, sample, pred_point):
         """Create and save cropped image, return path."""
         meta = sample['meta_data'][0]
         img_path = meta['img_url_abs']
         
-        # Create cropped image (don't delete original here as it might be needed elsewhere)
-        cropped_image, _ = crop_image_around_point(img_path, pred_point, cleanup_original=False)
+        # Create cropped image
+        cropped_image, _ = crop_image_around_point(img_path, pred_point)
         
         # Save cropped image temporarily
+        import tempfile
         temp_dir = tempfile.mkdtemp()
         cropped_path = os.path.join(temp_dir, f"cropped_{meta['id']}.jpg")
         cropped_image.save(cropped_path)
-        
-        # Clean up cropped image from memory immediately after saving
-        cropped_image.close()
-        del cropped_image
-        gc.collect()  # Force garbage collection
         
         return cropped_path
     
@@ -312,29 +286,6 @@ class CroppedImageDataset:
         }
         
         return cropped_sample
-    
-    def cleanup_temp_files(self):
-        """Clean up all temporary cropped image files."""
-        if not self.cleanup_temp_files:
-            return
-            
-        for temp_file in self.temp_files:
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    print(f"Cleaned up temporary file: {temp_file}")
-                # Also try to remove the temporary directory if empty
-                temp_dir = os.path.dirname(temp_file)
-                if os.path.exists(temp_dir) and not os.listdir(temp_dir):
-                    os.rmdir(temp_dir)
-            except OSError as e:
-                print(f"Warning: Could not clean up {temp_file}: {e}")
-        
-        self.temp_files.clear()
-    
-    def __del__(self):
-        """Ensure cleanup happens when dataset is destroyed."""
-        self.cleanup_temp_files()
 
 @torch.no_grad()
 def validate_screenspot(val_loader, model_engine, processor, epoch, global_step, writer, args, media=True):
@@ -382,6 +333,7 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
                 print(f"Sample {i} - First prediction point: {first_pred_point}")
             except Exception as e:
                 print(f"Sample {i} - Error parsing first prediction: {e}")
+                # Use a default center point if parsing fails
                 first_pred_point = [0.5, 0.5]
             
             # Calculate crop info for this prediction
@@ -393,21 +345,14 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
             first_round_predictions.append(first_pred_point)
             first_round_crop_infos.append(crop_info)
             
-            # Clean up GPU memory after each sample
-            del forward_dict
-            torch.cuda.empty_cache()
-            
         except Exception as e:
             print(f"Sample {i} - Error in first round inference: {e}")
             import traceback
             traceback.print_exc()
+            # Set default values on error
             first_round_samples.append(input_dict)
             first_round_predictions.append([0.5, 0.5])
             first_round_crop_infos.append(None)
-
-    # Force garbage collection after first round
-    gc.collect()
-    torch.cuda.empty_cache()
 
     # Gather first round results from all processes
     first_round_samples = gather_object(first_round_samples)
@@ -429,104 +374,93 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
                 valid_predictions.append(pred)
                 valid_crop_infos.append(crop_info)
         
-        # Create cropped dataset with cleanup enabled
-        cropped_dataset = CroppedImageDataset(valid_samples, valid_predictions, valid_crop_infos, cleanup_temp_files=True)
+        # Create cropped dataset
+        cropped_dataset = CroppedImageDataset(valid_samples, valid_predictions, valid_crop_infos)
         
-        try:
-            # Create new data loader for cropped images
-            cropped_sampler = torch.utils.data.distributed.DistributedSampler(
-                cropped_dataset, shuffle=False, drop_last=False
-            ) if args.distributed else None
-            
-            cropped_val_loader = torch.utils.data.DataLoader(
-                cropped_dataset,
-                batch_size=args.val_batch_size,
-                shuffle=False,
-                num_workers=args.workers,
-                pin_memory=True,
-                sampler=cropped_sampler,
-                collate_fn=partial(collate_fn, processor=processor),
-            )
-            
-            print(f"Created cropped dataset with {len(cropped_dataset)} samples")
-            
-            # Second round inference
-            print("Starting second round inference on cropped images...")
-            for i, cropped_input_dict in enumerate(tqdm(cropped_val_loader)):
-                torch.cuda.empty_cache()
-                
-                # Move to device and apply precision (same as original)
-                cropped_input_dict = dict_to_cuda(cropped_input_dict, device=f'cuda:{local_rank}')
+        # Create new data loader for cropped images
+        cropped_sampler = torch.utils.data.distributed.DistributedSampler(
+            cropped_dataset, shuffle=False, drop_last=False
+        ) if args.distributed else None
+        
+        cropped_val_loader = torch.utils.data.DataLoader(
+            cropped_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+            sampler=cropped_sampler,
+            collate_fn=partial(collate_fn, processor=processor),
+        )
+        
+        print(f"Created cropped dataset with {len(cropped_dataset)} samples")
+        
+        # Second round inference
+        print("Starting second round inference on cropped images...")
+        for i, cropped_input_dict in enumerate(tqdm(cropped_val_loader)):
+            torch.cuda.empty_cache()
+            cropped_input_dict = dict_to_cuda(cropped_input_dict, device=f'cuda:{local_rank}')
 
-                if args.precision == "fp16":
-                    cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].half()
-                elif args.precision == "bf16":
-                    cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].bfloat16()
-                else:
-                    cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].float()
+            if args.precision == "fp16":
+                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].half()
+            elif args.precision == "bf16":
+                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].bfloat16()
+            else:
+                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].float()
 
-                meta = cropped_input_dict['meta_data'][0]
-                crop_info = meta['crop_info']
-                first_pred_point = meta['first_pred_point']
+            meta = cropped_input_dict['meta_data'][0]
+            crop_info = meta['crop_info']
+            first_pred_point = meta['first_pred_point']
+            
+            try:
+                # Second round inference on cropped image
+                cropped_forward_dict = create_forward_dict(cropped_input_dict)
+                cropped_generated_text = run_inference(model_engine, cropped_forward_dict, processor)
                 
+                print(f"Sample {i} - Second round generated_texts: {cropped_generated_text}")
+                
+                # Parse cropped prediction and convert back to original coordinates
                 try:
-                    # Second round inference on cropped image
-                    cropped_forward_dict = create_forward_dict(cropped_input_dict)
-                    cropped_generated_text = run_inference(model_engine, cropped_forward_dict, processor)
+                    cropped_pred_point = ast.literal_eval(cropped_generated_text)
+                    final_pred_point = convert_cropped_coords_to_original(cropped_pred_point, crop_info)
                     
-                    print(f"Sample {i} - Second round generated_texts: {cropped_generated_text}")
+                    print(f"Sample {i} - Cropped prediction: {cropped_pred_point}")
+                    print(f"Sample {i} - Final prediction (original coords): {final_pred_point}")
                     
-                    # Parse cropped prediction and convert back to original coordinates
-                    try:
-                        cropped_pred_point = ast.literal_eval(cropped_generated_text)
-                        final_pred_point = convert_cropped_coords_to_original(cropped_pred_point, crop_info)
-                        
-                        print(f"Sample {i} - Cropped prediction: {cropped_pred_point}")
-                        print(f"Sample {i} - Final prediction (original coords): {final_pred_point}")
-                        
-                        pred_point = final_pred_point
-                        generated_text = str(final_pred_point)
-                        
-                    except Exception as e:
-                        print(f"Sample {i} - Error parsing/converting cropped prediction: {e}")
-                        pred_point = first_pred_point
-                        generated_text = str(first_pred_point)
-                        
-                    # Clean up GPU memory after each sample
-                    del cropped_forward_dict
-                    torch.cuda.empty_cache()
-                        
+                    # Use the refined prediction
+                    pred_point = final_pred_point
+                    generated_text = str(final_pred_point)
+                    
                 except Exception as e:
-                    print(f"Sample {i} - Error in second round inference: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"Sample {i} - Error parsing/converting cropped prediction: {e}")
+                    # Fall back to first prediction
                     pred_point = first_pred_point
                     generated_text = str(first_pred_point)
+                    
+            except Exception as e:
+                print(f"Sample {i} - Error in second round inference: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fall back to first prediction  
+                pred_point = first_pred_point
+                generated_text = str(first_pred_point)
 
-                # Create output dictionary (using original metadata)
-                original_meta = {k: v for k, v in meta.items() if k not in ['crop_info', 'first_pred_point']}
-                outputs = {
-                    "split": original_meta['split'], 
-                    'data_type': original_meta['data_type'],
-                    "anno_id": original_meta['id'], 
-                    "img_path": original_meta.get('img_url_abs_original', original_meta['img_url_abs']), 
-                    "instruction": original_meta['task'], 
-                    "sentence": generated_text,
-                    "bbox": original_meta['bbox'], 
-                    "meta": original_meta,
-                    'pred_point': pred_point
-                }
+            # Create output dictionary (using original metadata)
+            original_meta = {k: v for k, v in meta.items() if k not in ['crop_info', 'first_pred_point']}
+            outputs = {
+                "split": original_meta['split'], 
+                'data_type': original_meta['data_type'],
+                "anno_id": original_meta['id'], 
+                "img_path": original_meta.get('img_url_abs_original', original_meta['img_url_abs']), 
+                "instruction": original_meta['task'], 
+                "sentence": generated_text,
+                "bbox": original_meta['bbox'], 
+                "meta": original_meta,
+                'pred_point': pred_point
+            }
 
-                generated_texts_unique.append(generated_text)
-                answers_unique.append(original_meta['bbox'])
-                outputs_unique.append(outputs)
-                
-        finally:
-            # Always clean up temporary files, even if an error occurs
-            print("Cleaning up temporary cropped image files...")
-            cropped_dataset.cleanup_temp_files()
-            del cropped_dataset
-            gc.collect()
+            generated_texts_unique.append(generated_text)
+            answers_unique.append(original_meta['bbox'])
+            outputs_unique.append(outputs)
     
     else:
         # Non-master processes just wait
@@ -534,7 +468,6 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
         answers_unique = []
         outputs_unique = []
 
-    # Rest of the function remains the same...
     # Gather final results from all processes  
     answers_unique = gather_object(answers_unique)
     generated_texts_unique = gather_object(generated_texts_unique)

@@ -15,14 +15,7 @@ from data.template import navigation_to_qwen, batch_add_answer
 from qwen_vl_utils import process_vision_info
 
 dataset_mapping = {
-    "aitw": "AITW",
-    "amex": "AMEX",
     "guiact": "GUI_Course/GUIAct",
-    "mind2web": "Mind2Web",
-    "miniwob": "MiniWob",
-    "screenspot": "ScreenSpot",
-    "showui-desktop": "ShowUI-desktop",
-    "showui-web": "ShowUI-web",
 }
 
 
