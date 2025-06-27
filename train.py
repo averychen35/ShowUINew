@@ -22,7 +22,7 @@ from transformers import AutoProcessor, BitsAndBytesConfig      # do not remove 
 from main.trainer import train
 from main.eval_aitw import validate_aitw
 from main.eval_mind2web import validate_mind2web
-from main.eval_screenspot import validate_screenspot
+from main.eval_screenspot_new import validate_screenspot
 from main.evaluator import validate as validate_default
 
 from model.utils import find_target_linear_names
@@ -564,7 +564,7 @@ def main(args):
             batch_size=args.val_batch_size,
             shuffle=False,
             num_workers=args.workers,
-            pin_memory=False,
+            pin_memory=True,
             sampler=val_sampler,
             collate_fn=partial(
                 collate_fn,
