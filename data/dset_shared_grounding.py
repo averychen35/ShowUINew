@@ -14,12 +14,16 @@ sys.path.append('.')
 from data.template import grounding_to_qwen, batch_add_answer, batch_add_answer_append
 
 dataset_mapping = {
-    "showui-desktop": "ShowUI-desktop",
-    "showui-web": "ShowUI-web",
+    "aitw": "AITW",
     "amex": "AMEX",
-    "rico": "RICO",
-    "ricosca": "RICO",
-    "widget": "RICO",
+    "guiact": "GUI_Course/GUIAct",
+    "mind2web": "Mind2Web",
+    "miniwob": "MiniWob",
+    "screenspot": "ScreenSpot",
+    "showui-desktop": "ShowUI-desktop",
+    "showui-desktop-crop1": "ShowUI-desktop-crop1",
+    "showui-desktop-crop2": "ShowUI-desktop-crop2",
+    "showui-web": "ShowUI-web",
 }
 
 class GroundingDataset(torch.utils.data.Dataset):

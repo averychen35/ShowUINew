@@ -102,7 +102,7 @@ class HybridDataset(torch.utils.data.Dataset):
         self.all_datasets = []
         for dataset, json_split in zip(self.dset_list, self.json_list):
             # Grounding SFT
-            if dataset in ["showui-web","showui-desktop","amex"]:
+            if dataset in ["showui-web","showui-desktop","amex","showui-desktop-crop1","showui-desktop-crop2"]:
                 self.all_datasets.append(
                     GroundingDataset(
                         dataset_dir=args.dataset_dir,
@@ -213,6 +213,10 @@ class HybridDataset(torch.utils.data.Dataset):
             # training with randomly sampling but not repeatly
             elif self.random_sample and self.record_sample:
                 ind = np.random.choice(list(range(len(self.dset_list))), p=self.sample_rate)
+                print(f"length of self.dset list{len(self.dset_list)}")
+                print(f"index{ind}")
+                print(f"len of self.all_datasets{len(self.all_datasets)}")
+                print(f"self.all_datasets{self.all_datasets}")
                 data = self.all_datasets[ind]
                 unseen_indices = set(range(len(data))) - self.sample_recorder[ind]
                 if not unseen_indices:

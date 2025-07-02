@@ -147,11 +147,17 @@ class Mind2WebDataset(torch.utils.data.Dataset):
             assert len(image_list) == 1
             return curr_dict
 
-        step_history = sample['step_history']
+        #step_history = sample['step_history']
         action_history = []
         action_prefix = []
-        for i, step in enumerate(step_history[-num_history:]):
-            action = get_answer(step, step['step'], step['step_repr'])
+        
+        step_history = sample['step_history']
+        repr_history = sample['repr_history']
+        #for i, step in enumerate(step_history[-num_history:]):
+        for i, (step, step_repr) in enumerate(zip(step_history[-num_history:], repr_history[-num_history:]), start=1):
+            #print(step.keys())
+            #action = get_answer(step, step['step'], step['step_repr'])
+            action = get_answer(sample, step, step_repr)
             max_pixels = max(self.min_pixels, self.max_pixels * decay_factor ** (num_history - i))
             if interleaved_history == 'vvtt':
                 action_prefix.append({"type": "image", "image": image_list[i], "min_pixels": self.min_pixels, "max_pixels": max_pixels})

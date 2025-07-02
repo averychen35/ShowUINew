@@ -8,9 +8,7 @@ import torch
 import wandb
 import random
 import numpy as np
-import time
 from tqdm import tqdm
-import pickle
 from PIL import Image, ImageDraw
 import torch.distributed as dist
 from accelerate.utils import gather_object
@@ -30,155 +28,6 @@ from utils.utils import save_json
 
 import logging
 logging.basicConfig(level=logging.INFO)
-
-
-def wait_for_cuda_device(max_wait_time=300, check_interval=5):
-    """
-    Wait for CUDA device to become available
-    
-    Args:
-        max_wait_time (int): Maximum time to wait in seconds (default: 5 minutes)
-        check_interval (int): Time between checks in seconds (default: 5 seconds)
-    
-    Returns:
-        int or str: Device number if CUDA available, 'cpu' otherwise
-    """
-    start_time = time.time()
-    
-    while time.time() - start_time < max_wait_time:
-        if torch.cuda.is_available():
-            try:
-                # Try to allocate a small tensor to test device availability
-                device = torch.cuda.current_device()
-                test_tensor = torch.zeros(1, device=device)
-                del test_tensor  # Clean up
-                torch.cuda.empty_cache()
-                print(f"CUDA device {device} is now available")
-                return device
-            except RuntimeError as e:
-                if "busy" in str(e).lower() or "unavailable" in str(e).lower():
-                    print(f"CUDA device busy, waiting {check_interval} seconds... ({time.time() - start_time:.1f}s elapsed)")
-                    time.sleep(check_interval)
-                    continue
-                else:
-                    # Different CUDA error, try device 0
-                    try:
-                        test_tensor = torch.zeros(1, device=0)
-                        del test_tensor
-                        torch.cuda.empty_cache()
-                        print(f"Using CUDA device 0")
-                        return 0
-                    except:
-                        print(f"CUDA error: {e}, will use CPU")
-                        return 'cpu'
-        else:
-            print("CUDA not available, using CPU")
-            return 'cpu'
-    
-    print(f"Timeout waiting for CUDA device ({max_wait_time}s), using CPU")
-    return 'cpu'
-
-
-def gather_objects_memory_efficient(obj_list, max_size_mb: int = 100):
-    """
-    Memory-efficient alternative to gather_object that processes in chunks
-    """
-    if not dist.is_initialized():
-        return obj_list
-    
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    
-    # Handle empty obj_list case
-    if not obj_list:
-        # Create a placeholder to avoid serialization issues
-        serialized_data = pickle.dumps([])
-    else:
-        # Serialize the object list
-        serialized_data = pickle.dumps(obj_list)
-    
-    data_size = len(serialized_data)
-    
-    # Calculate chunk size based on memory limit
-    max_size_bytes = max_size_mb * 1024 * 1024
-    chunk_size = min(max_size_bytes, max(data_size, 1))  # Ensure minimum chunk size of 1
-    
-    # Create chunks
-    if data_size == 0:
-        chunks = [b'']  # Single empty chunk
-    else:
-        chunks = [serialized_data[i:i+chunk_size] for i in range(0, data_size, chunk_size)]
-    
-    num_chunks = len(chunks)
-    
-    # Wait for device to become available
-    device = wait_for_cuda_device(max_wait_time=500)  # Wait up to 1 minute
-    
-    # Gather number of chunks from all ranks
-    num_chunks_tensor = torch.tensor([num_chunks], dtype=torch.long, device=device)
-    all_num_chunks = [torch.zeros_like(num_chunks_tensor) for _ in range(world_size)]
-    dist.all_gather(all_num_chunks, num_chunks_tensor)
-    max_chunks = max(t.item() for t in all_num_chunks)
-    
-    print("gathered chunks from all ranks")
-    
-    # Gather chunks one by one
-    all_serialized_data = [b''] * world_size  # Initialize with empty bytes for each rank
-    
-    for chunk_idx in range(max_chunks):
-        # Prepare chunk (pad with empty bytes if this rank has fewer chunks)
-        if chunk_idx < len(chunks):
-            chunk = chunks[chunk_idx]
-        else:
-            chunk = b''
-        
-        # Ensure chunk is not empty for tensor creation
-        if len(chunk) == 0:
-            chunk = b'\x00'  # Single null byte as placeholder
-            actual_chunk_size = 0  # Track that this is actually empty
-        else:
-            actual_chunk_size = len(chunk)
-        
-        # Convert to tensor
-        chunk_bytes = torch.frombuffer(chunk, dtype=torch.uint8).to(device)
-        chunk_size_tensor = torch.tensor([actual_chunk_size], dtype=torch.long, device=device)
-        
-        print("convert chunks to tensors")
-        
-        # Gather chunk sizes
-        all_chunk_sizes = [torch.zeros_like(chunk_size_tensor) for _ in range(world_size)]
-        dist.all_gather(all_chunk_sizes, chunk_size_tensor)
-        max_chunk_size = max(max(t.item() for t in all_chunk_sizes), 1)  # Ensure minimum size of 1
-        
-        # Pad chunk to max size
-        if len(chunk_bytes) < max_chunk_size:
-            padding = torch.zeros(max_chunk_size - len(chunk_bytes), dtype=torch.uint8, device=device)
-            chunk_bytes = torch.cat([chunk_bytes, padding])
-        
-        # Gather chunks
-        all_chunks = [torch.zeros_like(chunk_bytes) for _ in range(world_size)]
-        dist.all_gather(all_chunks, chunk_bytes)
-        
-        # Store valid chunks
-        for rank_idx, (chunk_tensor, actual_size) in enumerate(zip(all_chunks, all_chunk_sizes)):
-            actual_size_val = actual_size.item()
-            if actual_size_val > 0:
-                valid_chunk = chunk_tensor[:actual_size_val].cpu().numpy().tobytes()
-                all_serialized_data[rank_idx] += valid_chunk
-    
-    # Deserialize all data
-    all_objects = []
-    for serialized in all_serialized_data:
-        if serialized:
-            try:
-                objects = pickle.loads(serialized)
-                if objects:  # Only extend if objects is not empty
-                    all_objects.extend(objects)
-            except Exception as e:
-                print(f"Warning: Failed to deserialize data: {e}")
-                pass  # Skip corrupted data
-    
-    return all_objects
 
 def broadcast_value(value, src=0, local_rank=0):
     tensor = torch.tensor([value], dtype=torch.float32).to(f'cuda:{local_rank}')
@@ -475,15 +324,7 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
         
         try:
             # First round inference on original image
-            device = 0
-            allocated_bytes = torch.cuda.memory_allocated(device)
-            allocated_gb = allocated_bytes / 1024 / 1024 / 1024
-            print(f"Memory allocated: before creating forward dict {allocated_gb:.4f} GB")
-            
             forward_dict = create_forward_dict(input_dict)
-            allocated_bytes = torch.cuda.memory_allocated(device)
-            allocated_gb = allocated_bytes / 1024 / 1024 / 1024
-            print(f"Memory allocated: before first inference {allocated_gb:.4f} GB")
             generated_text = run_inference(model_engine, forward_dict, processor)
             
             print(f"Sample {i} - First round generated_texts: {generated_text}")
@@ -499,9 +340,6 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
             
             # Calculate crop info for this prediction
             img_path = meta['img_url_abs']
-            allocated_bytes = torch.cuda.memory_allocated(device)
-            allocated_gb = allocated_bytes / 1024 / 1024 / 1024
-            print(f"Memory allocated: before cropping {allocated_gb:.4f} GB")
             _, crop_info = crop_image_around_point(img_path, first_pred_point)
             
             # Store data for second round
@@ -519,17 +357,12 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
             first_round_crop_infos.append(None)
 
     # Gather first round results from all processes
-        allocated_bytes = torch.cuda.memory_allocated(device)
-    allocated_gb = allocated_bytes / 1024 / 1024 / 1024
-    print(f"Memory allocated: before gather_object first round {allocated_gb:.4f} GB")
+    first_round_samples = gather_object(first_round_samples)
+    first_round_predictions = gather_object(first_round_predictions) 
+    first_round_crop_infos = gather_object(first_round_crop_infos)
     
-    first_round_samples = gather_objects_memory_efficient(first_round_samples)
-    first_round_predictions = gather_objects_memory_efficient(first_round_predictions) 
-    first_round_crop_infos = gather_objects_memory_efficient(first_round_crop_infos)
-    
-    # Second round: create new dataset and loader for cropped images
-    # Let ALL ranks process their portion of the data
-    print(f"Rank {global_rank}: Creating cropped image dataset for second round...")
+    # Second round: create cropped dataset (on all ranks since gather_object gives full data to all ranks)
+    print("Creating cropped image dataset for second round...")
     
     # Filter out samples with None crop_info
     valid_samples = []
@@ -542,118 +375,101 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
             valid_predictions.append(pred)
             valid_crop_infos.append(crop_info)
     
-    print(f"Rank {global_rank}: Found {len(valid_samples)} valid samples after filtering")
+    print(f"Rank {global_rank}: Processing {len(valid_samples)} valid samples in second round")
     
-    # Initialize empty lists for results (each rank will populate these)
-    generated_texts_unique = []
-    answers_unique = []
-    outputs_unique = []
+    # Create cropped dataset (on all ranks)
+    cropped_dataset = CroppedImageDataset(valid_samples, valid_predictions, valid_crop_infos)
     
-    if len(valid_samples) > 0:
-        # Create cropped dataset
-        cropped_dataset = CroppedImageDataset(valid_samples, valid_predictions, valid_crop_infos)
-        
-        # Create new data loader for cropped images with distributed sampler
-        cropped_sampler = torch.utils.data.distributed.DistributedSampler(
-            cropped_dataset, shuffle=False, drop_last=False
-        ) if args.distributed else None
-        
-        cropped_val_loader = torch.utils.data.DataLoader(
-            cropped_dataset,
-            batch_size=args.val_batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            pin_memory=True,
-            sampler=cropped_sampler,
-            collate_fn=partial(collate_fn, processor=processor),
-        )
-        
-        print(f"Rank {global_rank}: Created cropped dataset with {len(cropped_dataset)} samples")
-        print(f"Rank {global_rank}: Cropped loader has {len(cropped_val_loader)} batches")
-        
-        # Second round inference - each rank processes its assigned portion
-        print(f"Rank {global_rank}: Starting second round inference on cropped images...")
-        for i, cropped_input_dict in enumerate(tqdm(cropped_val_loader)):
-            torch.cuda.empty_cache()
-            cropped_input_dict = dict_to_cuda(cropped_input_dict, device=f'cuda:{local_rank}')
+    # Create new data loader for cropped images
+    cropped_sampler = torch.utils.data.distributed.DistributedSampler(
+        cropped_dataset, shuffle=False, drop_last=False
+    ) if args.distributed else None
+    
+    cropped_val_loader = torch.utils.data.DataLoader(
+        cropped_dataset,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=cropped_sampler,
+        collate_fn=partial(collate_fn, processor=processor),
+    )
+    
+    print(f"Rank {global_rank}: Created cropped dataset with {len(cropped_dataset)} samples")
+    
+    # Second round inference on cropped images
+    print("Starting second round inference on cropped images...")
+    for i, cropped_input_dict in enumerate(tqdm(cropped_val_loader)):
+        torch.cuda.empty_cache()
+        cropped_input_dict = dict_to_cuda(cropped_input_dict, device=f'cuda:{local_rank}')
 
-            if args.precision == "fp16":
-                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].half()
-            elif args.precision == "bf16":
-                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].bfloat16()
-            else:
-                cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].float()
+        if args.precision == "fp16":
+            cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].half()
+        elif args.precision == "bf16":
+            cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].bfloat16()
+        else:
+            cropped_input_dict["pixel_values"] = cropped_input_dict["pixel_values"].float()
 
-            meta = cropped_input_dict['meta_data'][0]
-            crop_info = meta['crop_info']
-            first_pred_point = meta['first_pred_point']
+        meta = cropped_input_dict['meta_data'][0]
+        crop_info = meta['crop_info']
+        first_pred_point = meta['first_pred_point']
+        
+        try:
+            # Second round inference on cropped image
+            cropped_forward_dict = create_forward_dict(cropped_input_dict)
+            cropped_generated_text = run_inference(model_engine, cropped_forward_dict, processor)
             
+            print(f"Rank {global_rank}, Sample {i} - Second round generated_texts: {cropped_generated_text}")
+            
+            # Parse cropped prediction and convert back to original coordinates
             try:
-                # Second round inference on cropped image
-                cropped_forward_dict = create_forward_dict(cropped_input_dict)
-                cropped_generated_text = run_inference(model_engine, cropped_forward_dict, processor)
+                cropped_pred_point = ast.literal_eval(cropped_generated_text)
+                final_pred_point = convert_cropped_coords_to_original(cropped_pred_point, crop_info)
                 
-                print(f"Rank {global_rank}, Sample {i} - Second round generated_texts: {cropped_generated_text}")
+                print(f"Rank {global_rank}, Sample {i} - Cropped prediction: {cropped_pred_point}")
+                print(f"Rank {global_rank}, Sample {i} - Final prediction (original coords): {final_pred_point}")
                 
-                # Parse cropped prediction and convert back to original coordinates
-                try:
-                    cropped_pred_point = ast.literal_eval(cropped_generated_text)
-                    final_pred_point = convert_cropped_coords_to_original(cropped_pred_point, crop_info)
-                    
-                    print(f"Rank {global_rank}, Sample {i} - Cropped prediction: {cropped_pred_point}")
-                    print(f"Rank {global_rank}, Sample {i} - Final prediction (original coords): {final_pred_point}")
-                    
-                    # Use the refined prediction
-                    pred_point = final_pred_point
-                    generated_text = str(final_pred_point)
-                    
-                except Exception as e:
-                    print(f"Rank {global_rank}, Sample {i} - Error parsing/converting cropped prediction: {e}")
-                    # Fall back to first prediction
-                    pred_point = first_pred_point
-                    generated_text = str(first_pred_point)
-                    
+                # Use the refined prediction
+                pred_point = final_pred_point
+                generated_text = str(final_pred_point)
+                
             except Exception as e:
-                print(f"Rank {global_rank}, Sample {i} - Error in second round inference: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fall back to first prediction  
+                print(f"Rank {global_rank}, Sample {i} - Error parsing/converting cropped prediction: {e}")
+                # Fall back to first prediction
                 pred_point = first_pred_point
                 generated_text = str(first_pred_point)
+                
+        except Exception as e:
+            print(f"Rank {global_rank}, Sample {i} - Error in second round inference: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fall back to first prediction  
+            pred_point = first_pred_point
+            generated_text = str(first_pred_point)
 
-            # Create output dictionary (using original metadata)
-            original_meta = {k: v for k, v in meta.items() if k not in ['crop_info', 'first_pred_point']}
-            outputs = {
-                "split": original_meta['split'], 
-                'data_type': original_meta['data_type'],
-                "anno_id": original_meta['id'], 
-                "img_path": original_meta.get('img_url_abs_original', original_meta['img_url_abs']), 
-                "instruction": original_meta['task'], 
-                "sentence": generated_text,
-                "bbox": original_meta['bbox'], 
-                "meta": original_meta,
-                'pred_point': pred_point
-            }
+        # Create output dictionary (using original metadata)
+        original_meta = {k: v for k, v in meta.items() if k not in ['crop_info', 'first_pred_point']}
+        outputs = {
+            "split": original_meta['split'], 
+            'data_type': original_meta['data_type'],
+            "anno_id": original_meta['id'], 
+            "img_path": original_meta.get('img_url_abs_original', original_meta['img_url_abs']), 
+            "instruction": original_meta['task'], 
+            "sentence": generated_text,
+            "bbox": original_meta['bbox'], 
+            "meta": original_meta,
+            'pred_point': pred_point
+        }
 
-            generated_texts_unique.append(generated_text)
-            answers_unique.append(original_meta['bbox'])
-            outputs_unique.append(outputs)
-    else:
-        print(f"Rank {global_rank}: No valid samples for second round processing")
-    
-    print(f"Rank {global_rank}: Completed second round with {len(outputs_unique)} results")
-    
-    # Broadcast results to all processes
-    if global_rank != 0:
-        # Non-master processes initialize empty lists
-        generated_texts_unique = []
-        answers_unique = []
-        outputs_unique = []
+        generated_texts_unique.append(generated_text)
+        answers_unique.append(original_meta['bbox'])
+        outputs_unique.append(outputs)
+
 
     # Gather final results from all processes  
-    answers_unique = gather_objects_memory_efficient(answers_unique)
-    generated_texts_unique = gather_objects_memory_efficient(generated_texts_unique)
-    outputs_unique = gather_objects_memory_efficient(outputs_unique)
+    answers_unique = gather_object(answers_unique)
+    generated_texts_unique = gather_object(generated_texts_unique)
+    outputs_unique = gather_object(outputs_unique)
 
     if global_rank == 0:
         results = {}
@@ -720,7 +536,7 @@ def validate_screenspot(val_loader, model_engine, processor, epoch, global_step,
                     sample = random.choice(results[split][type])
                     img_anno = sample['anno_id']
                     img_url = sample['img_path']
-                    img_inst = sample['instruction'] 
+                    img_inst = sample['instruction']
                     gt_bbox = sample['gt_bbox']
                     if 'pred_point' in sample:
                         pred_point = sample['pred_point']
